@@ -3,27 +3,32 @@ import os
 
 import numpy as np
 import torch
-from skimage.measure import peak_signal_noise_ratio as compare_psnr
+import torch.optim
+from absl import app, flags
+from skimage.measure import compare_psnr
 from torch.autograd import Variable
+from torchvision import models
+from tqdm import tqdm
 
-from models import *
-from utils.denoising_utils import *
+from .idip_defend.models.skip import skip
+from .idip_defend.utils.common_utils import *
 
-parser = argparse.ArgumentParser(description="Args for DIPDefend")
-parser.add_argument("--fname", help="The name of the attacked image", type=str)
-parser.add_argument(
-    "--out_dir", default=".", help="The directory used to save the output", type=str
+FLAGS = flags.FLAGS
+flags.DEFINE_string(
+    "target_img_name", help="The name of the attacked image", required=True
 )
-parser.add_argument(
-    "--num_iter", default=1200, type=int, help="Number of total iterations to run"
+flags.DEFINE_string(
+    "save_dir",
+    default="./script_logpoint",
+    help="The directory used to save the output",
 )
-parser.add_argument(
-    "--input_depth", default=1, type=int, help="Input depth for the generator"
+flags.DEFINE_integer("SES_lambda", default=0.002, help="Hyperparameter of SES")
+flags.DEFINE_string(
+    "target_img_domain",
+    help="The domain of the attacked image",
+    required=True,
+    flag_values=["cifar", "imagenet"],
 )
-parser.add_argument(
-    "--lr", default=0.01, type=float, help="Learning rate for the optimizer"
-)
-parser.add_argument("--Lambda", default=0.002, type=float, help="Hyperparameter of SES")
 
 torch.backends.cudnn.enabled = True
 torch.backends.cudnn.benchmark = True
@@ -61,186 +66,114 @@ def adapative_psnr(img1, img2, size=32):
     return psnr
 
 
-class Mulnet(nn.Module):
-    """
-    This model splits the input into num x num patches and applies a copy of
-    the given model to each patch.
-    """
+def main(argv):
+    LAMBDA = FLAGS.SES_lambda
+    img_noisy_pil = crop_image(get_image(FLAGS.target_img_name, -1)[0], d=32)
+    img_noisy_np = pil_to_np(img_noisy_pil)
+    reg_noise_std = 1.0 / 30.0
 
-    def __init__(self, model, num):
-        super(Mulnet, self).__init__()
-        self.models = nn.Sequential(*[model() for i in range(num * num)])
-        self.num = num
+    if FLAGS.target_img_domain == "cifar":
+        input_depth = 1
+        num_iter = 1200
+        dip_net = skip(
+            num_input_channels=input_depth,
+            num_output_channels=3,
+            num_channels_down=[16, 32, 64, 128],
+            num_channels_up=[16, 32, 64, 128],
+            num_channels_skip=[4, 4, 4, 4],
+            upsample_mode="nearest",
+            need_sigmoid=False,
+            pad="reflection",
+            act_fun="LeakyReLU",
+        )
+    elif FLAGS.target_img_domain == "imagenet":
+        input_depth = 3
+        num_iter = 2400
+        dip_net = skip(
+            num_input_channels=input_depth,
+            num_output_channels=3,
+            num_channels_down=[16, 32, 64, 128, 128],
+            num_channels_up=[16, 32, 64, 128, 128],
+            num_channels_skip=[4, 4, 4, 4, 4],
+            upsample_mode="nearest",
+            need_sigmoid=False,  # remove
+            pad="reflection",
+            act_fun="LeakyReLU",
+        )
+    else:
+        raise ValueError(f"Unsupported target image domain: {FLAGS.target_img_domain}")
 
-    def forward(self, x):
-        (
-            _,
-            _,
-            h,
-            w,
-        ) = x.shape
-        num = self.num
-        h_base, w_base = int(h // num), int(w // num)
-        x_out = []
-
-        for i in range(num):
-            for j in range(num):
-                x_out.append(
-                    self.models[i * num + j](
-                        x[
-                            :,
-                            :,
-                            h_base * i : h_base * (i + 1),
-                            w_base * j : w_base * (j + 1),
-                        ]
-                    )
-                )
-
-        N, C, _, _ = x_out[-1].shape
-        result = torch.FloatTensor(np.zeros((N, C, h, w))).type(dtype).to(0)
-
-        for i in range(num):
-            for j in range(num):
-                result[
-                    :, :, h_base * i : h_base * (i + 1), w_base * j : w_base * (j + 1)
-                ] += x_out[i * num + j]
-        return result
-
-
-args = parser.parse_args()
-
-attack_fname = args.fname
-img_noisy_pil = crop_image(get_image(attack_fname, -1)[0], d=32)
-
-img_noisy_np = pil_to_np(img_noisy_pil)
-
-out_dir = args.out_dir
-
-LAMBDA = args.Lambda
-reg_noise_std = -1.0 / 20.0
-LR = args.lr
-num_iter = args.num_iter
-input_depth = args.input_depth
-
-
-def Net():
-    return skip(
-        input_depth,
-        3,
-        num_channels_down=[3, 3, 4],
-        num_channels_up=[3, 3, 4],
-        num_channels_skip=[0, 0, 0],
-        upsample_mode="bilinear",
-    ).type(dtype)
-
-
-net = Mulnet(Net, int(img_noisy_np.shape[1] / 32))
-series, out_series, delta_series = [], [], []
-psnr_max_img = None
-SES_img = None
-
-net_inputs = []
-for i in range(1):
+    net = dip_net.type(dtype)
+    series, out_series, delta_series = [], [], []
+    psnr_max_img = None
+    SES_img = None
     net_input = (
         get_noise(input_depth, "noise", (img_noisy_pil.size[1], img_noisy_pil.size[0]))
         .type(dtype)
         .detach()
     )
-    net_inputs.append(net_input.squeeze(0).cpu().numpy())
-net_input = torch.FloatTensor(np.array(net_inputs)).type(dtype).detach().to(0)
 
-# Compute number of parameters
-s = sum([np.prod(list(p.size())) for p in net.parameters()])
-print("Number of params: %d" % s)
+    # Compute number of parameters
+    s = sum([np.prod(list(p.size())) for p in net.parameters()])
+    print("Number of params: %d" % s)
 
-# Loss
-mse = torch.nn.MSELoss().type(dtype)
+    # Loss
+    mse = torch.nn.MSELoss().type(dtype)
 
-img_noisy_torch = np_to_torch(img_noisy_np).type(dtype)
-net_input_saved = net_input.detach().clone()
-noise = net_input.detach().clone()
+    img_noisy_torch = np_to_torch(img_noisy_np).type(dtype)
+    net_input_saved = net_input.detach().clone()
+    noise = net_input.detach().clone()
 
+    def closure():
 
-def closure():
+        global net_input
+        global psnr_max_img, SES_img
 
-    global net_input
-    global psnr_max_img, SES_img
+        if reg_noise_std > 0:
+            net_input = net_input_saved + (noise.normal_() * reg_noise_std)
 
-    if reg_noise_std > 0:
-        net_input = net_input_saved + (noise.normal_() * reg_noise_std)
+        out = net(net_input)
 
-    out = net(net_input)
-    total_loss = mse(out.mean(dim=0, keepdim=True), img_noisy_torch)
-    total_loss.backward()
+        total_loss = mse(out.mean(dim=0, keepdim=True), img_noisy_torch)
+        total_loss.backward()
 
-    psrn_gt = adapative_psnr(img_noisy_np, out.detach().cpu().numpy().mean(axis=0))
+        psrn_gt = adapative_psnr(img_noisy_np, out.detach().cpu().numpy().mean(axis=0))
 
-    if len(series) == 0:
-        series.append(psrn_gt)
-        out_series.append(psrn_gt)
-    elif len(series) == 1:
-        series.append(psrn_gt)
-        delta_series.append(series[1] - series[0])
-        out_series.append(
-            LAMBDA * series[-1] + (1 - LAMBDA) * (out_series[-1] + delta_series[-1])
-        )
-    else:
-        series.append(psrn_gt)
-        s = LAMBDA * series[-1] + (1 - LAMBDA) * (out_series[-1] + delta_series[-1])
-        t = LAMBDA * (s - out_series[-1]) + (1 - LAMBDA) * (delta_series[-1])
-        out_series.append(s)
-        delta_series.append(t)
-        if out_series[-1] > np.array(out_series[:-1]).max():
-            SES_img = out.detach().cpu().numpy().mean(axis=0)
+        if len(series) == 0:
+            series.append(psrn_gt)
+            out_series.append(psrn_gt)
+        elif len(series) == 1:
+            series.append(psrn_gt)
+            delta_series.append(series[1] - series[0])
+            out_series.append(
+                LAMBDA * series[-1] + (1 - LAMBDA) * (out_series[-1] + delta_series[-1])
+            )
+        else:
+            series.append(psrn_gt)
+            s = LAMBDA * series[-1] + (1 - LAMBDA) * (out_series[-1] + delta_series[-1])
+            t = LAMBDA * (s - out_series[-1]) + (1 - LAMBDA) * (delta_series[-1])
+            out_series.append(s)
+            delta_series.append(t)
+            if out_series[-1] > np.array(out_series[:-1]).max():
+                SES_img = out.detach().cpu().numpy().mean(axis=0)
 
-    return total_loss
+        return total_loss
 
+    p = get_params("net,input", net, net_input)
 
-p = get_params("net,input", net, net_input)
+    optimizer = torch.optim.Adam(p, lr=0.01)
+    for j in tqdm(range(num_iter), desc="DIP Denoising iterations"):
+        optimizer.zero_grad()
+        closure()
+        optimizer.step()
 
-
-def optimize(optimizer_type, parameters, closure, LR, num_iter):
-    """Runs optimization loop.
-
-    Args:
-        optimizer_type: 'LBFGS' of 'adam'
-        parameters: list of Tensors to optimize over
-        closure: function, that returns loss variable
-        LR: learning rate
-        num_iter: number of iterations
-    """
-    if optimizer_type == "LBFGS":
-        # Do several steps with adam first
-        optimizer = torch.optim.Adam(parameters, lr=0.001)
-        for j in range(100):
-            optimizer.zero_grad()
-            closure()
-            optimizer.step()
-
-        print("Starting optimization with LBFGS")
-
-        def closure2():
-            optimizer.zero_grad()
-            return closure()
-
-        optimizer = torch.optim.LBFGS(
-            parameters, max_iter=num_iter, lr=LR, tolerance_grad=-1, tolerance_change=-1
-        )
-        optimizer.step(closure2)
-
-    elif optimizer_type == "adam":
-        print("Starting optimization with ADAM")
-        optimizer = torch.optim.Adam(parameters, lr=LR)
-
-        for j in range(num_iter):
-            optimizer.zero_grad()
-            closure()
-            optimizer.step()
-    else:
-        assert False
+    np.save(
+        os.path.join(
+            FLAGS.save_dir, f"SES_defended_{os.path.basename(FLAGS.target_img_name)}"
+        ),
+        SES_img,
+    )
 
 
-optimize("adam", p, closure, LR, num_iter)
-
-np.save(os.path.join(out_dir, "defense_inflection.npy"), SES_img)
-np_to_pil(SES_img).save(os.path.join(out_dir, "defense_inflection.png"))
+if __name__ == "__main__":
+    app.run(main)

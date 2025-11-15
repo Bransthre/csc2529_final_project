@@ -131,3 +131,5 @@ dmypy.json
 .vscode
 dataset
 defense_*.py
+attack_examples/*
+blas_the_dog/*
