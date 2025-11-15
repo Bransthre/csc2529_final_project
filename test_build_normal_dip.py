@@ -5,30 +5,33 @@ import numpy as np
 import torch
 import torch.optim
 from absl import app, flags
-from skimage.measure import compare_psnr
+from skimage.metrics import peak_signal_noise_ratio as compare_psnr
 from torch.autograd import Variable
 from torchvision import models
 from tqdm import tqdm
 
-from .idip_defend.models.skip import skip
-from .idip_defend.utils.common_utils import *
+from idip_defend.models.skip import get_skip_net_special, skip
+from idip_defend.utils.common_utils import *
 
 FLAGS = flags.FLAGS
 flags.DEFINE_string(
-    "target_img_name", help="The name of the attacked image", required=True
+    "target_img_name",
+    default=None,
+    help="The name of the attacked image",
+    required=True,
+)
+flags.DEFINE_string(
+    "target_img_domain",
+    default=None,
+    help="The domain of the attacked image",
+    required=True,
 )
 flags.DEFINE_string(
     "save_dir",
     default="./script_logpoint",
     help="The directory used to save the output",
 )
-flags.DEFINE_integer("SES_lambda", default=0.002, help="Hyperparameter of SES")
-flags.DEFINE_string(
-    "target_img_domain",
-    help="The domain of the attacked image",
-    required=True,
-    flag_values=["cifar", "imagenet"],
-)
+flags.DEFINE_float("SES_lambda", default=0.002, help="Hyperparameter of SES")
 
 torch.backends.cudnn.enabled = True
 torch.backends.cudnn.benchmark = True
@@ -67,11 +70,6 @@ def adapative_psnr(img1, img2, size=32):
 
 
 def main(argv):
-    LAMBDA = FLAGS.SES_lambda
-    img_noisy_pil = crop_image(get_image(FLAGS.target_img_name, -1)[0], d=32)
-    img_noisy_np = pil_to_np(img_noisy_pil)
-    reg_noise_std = 1.0 / 30.0
-
     if FLAGS.target_img_domain == "cifar":
         input_depth = 1
         num_iter = 1200
@@ -100,22 +98,48 @@ def main(argv):
             pad="reflection",
             act_fun="LeakyReLU",
         )
+    elif FLAGS.target_img_domain == "test_snail":
+        input_depth = 3
+        num_iter = 2400
+        dip_net = skip(
+            input_depth,
+            3,
+            num_channels_down=[8, 16, 32, 64, 128],
+            num_channels_up=[8, 16, 32, 64, 128],
+            num_channels_skip=[0, 0, 0, 4, 4],
+            upsample_mode="bilinear",
+            need_sigmoid=True,
+            need_bias=True,
+            pad="reflection",
+            act_fun="LeakyReLU",
+        )
+    elif FLAGS.target_img_domain == "test_jet":
+        input_depth = 32
+        num_iter = 3000
+        dip_net = get_skip_net_special(
+            input_depth=input_depth,
+            upsample_mode="bilinear",
+            pad="reflection",
+            skip_n33d=128,
+            skip_n33u=128,
+            skip_n11=4,
+            num_scales=5,
+        )
     else:
         raise ValueError(f"Unsupported target image domain: {FLAGS.target_img_domain}")
 
     net = dip_net.type(dtype)
     series, out_series, delta_series = [], [], []
-    psnr_max_img = None
-    SES_img = None
+    psnr_max_img, SES_img = None, None
+
+    img_noisy_pil = crop_image(get_image(FLAGS.target_img_name, -1)[0], d=32)
+    img_noisy_np = pil_to_np(img_noisy_pil)
+    reg_noise_std = 1.0 / 30.0
     net_input = (
         get_noise(input_depth, "noise", (img_noisy_pil.size[1], img_noisy_pil.size[0]))
         .type(dtype)
         .detach()
     )
-
-    # Compute number of parameters
-    s = sum([np.prod(list(p.size())) for p in net.parameters()])
-    print("Number of params: %d" % s)
 
     # Loss
     mse = torch.nn.MSELoss().type(dtype)
@@ -123,12 +147,10 @@ def main(argv):
     img_noisy_torch = np_to_torch(img_noisy_np).type(dtype)
     net_input_saved = net_input.detach().clone()
     noise = net_input.detach().clone()
+    LAMBDA = FLAGS.SES_lambda
 
-    def closure():
-
-        global net_input
-        global psnr_max_img, SES_img
-
+    # Can probably clean the series thing up a bit more
+    def closure(net_input, psnr_max_img, SES_img):
         if reg_noise_std > 0:
             net_input = net_input_saved + (noise.normal_() * reg_noise_std)
 
@@ -156,22 +178,34 @@ def main(argv):
             delta_series.append(t)
             if out_series[-1] > np.array(out_series[:-1]).max():
                 SES_img = out.detach().cpu().numpy().mean(axis=0)
+            if series[-1] > np.array(series[:-1]).max():
+                psnr_max_img = out.detach().cpu().numpy().mean(axis=0)
 
-        return total_loss
+        return total_loss, (net_input, psnr_max_img, SES_img)
 
-    p = get_params("net,input", net, net_input)
+    # Compute number of parameters
+    s = sum([np.prod(list(p.size())) for p in net.parameters()])
+    print("Number of params: %d" % s)
+    total_params = get_params("net,input", net, net_input)
 
-    optimizer = torch.optim.Adam(p, lr=0.01)
-    for j in tqdm(range(num_iter), desc="DIP Denoising iterations"):
+    optimizer = torch.optim.Adam(total_params, lr=0.01)
+    for n_train_iter in tqdm(range(num_iter), desc="DIP Denoising iterations"):
         optimizer.zero_grad()
-        closure()
+        dip_loss, (net_input, psnr_max_img, SES_img) = closure(
+            net_input, psnr_max_img, SES_img
+        )
+        if n_train_iter % (num_iter // 15) == 0:
+            print(f"Iteration {n_train_iter}: DIP loss {dip_loss.item()}")
         optimizer.step()
 
+    file_codename = os.path.basename(FLAGS.target_img_name).split(".")[0]
     np.save(
-        os.path.join(
-            FLAGS.save_dir, f"SES_defended_{os.path.basename(FLAGS.target_img_name)}"
-        ),
+        os.path.join(FLAGS.save_dir, f"SES_defended_{file_codename}"),
         SES_img,
+    )
+    np.save(
+        os.path.join(FLAGS.save_dir, f"PSNRMax_defended_{file_codename}"),
+        psnr_max_img,
     )
 
 
