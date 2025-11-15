@@ -1,15 +1,13 @@
 import copy
 import os
+import pickle
 
 import numpy as np
 import torch
-import torch.optim
 import torchattacks
 from absl import app, flags
-from skimage.metrics import peak_signal_noise_ratio as compare_psnr
-from torch.autograd import Variable
 from torch.utils.data import DataLoader
-from torchvision import models, transforms
+from torchvision import models
 from tqdm import tqdm
 
 from idip_defend.models.skip import skip
@@ -37,37 +35,6 @@ flags.DEFINE_integer("attack_length", default=5, help="Length of attack sequence
 torch.backends.cudnn.enabled = True
 torch.backends.cudnn.benchmark = True
 dtype = torch.cuda.FloatTensor
-
-
-def preprocess_image(cv2im, resize_im=True):
-    """
-        Processes image for CNNs
-
-    Args:
-        PIL_img (PIL_img): Image to process
-        resize_im (bool): Resize to 224 or not
-    returns:
-        im_as_var (Pytorch variable): Variable that contains processed float tensor
-    """
-
-    im_as_ten = torch.from_numpy(cv2im).float()
-    im_as_ten.unsqueeze_(0)
-    im_as_var = Variable(im_as_ten, requires_grad=False).to(0)
-    return im_as_var
-
-
-def adapative_psnr(img1, img2, size=32):
-    psnr, area_cnt = [], 0
-    _, h, w = img1.shape
-
-    for i in range(int(h // size)):
-        for j in range(int(w // size)):
-            img1_part = img1[:, i * size : (i + 1) * size, j * size : (j + 1) * size]
-            img2_part = img2[:, i * size : (i + 1) * size, j * size : (j + 1) * size]
-            psnr.append(compare_psnr(img1_part, img2_part))
-            area_cnt += 1
-    psnr = np.array(psnr).min()
-    return psnr
 
 
 def main(argv):
@@ -122,6 +89,7 @@ def main(argv):
     resnet50.eval()
     model = copy.deepcopy(resnet50)
     model = nn.Sequential(transform_layer(), model)
+    model.eval()
     mse = torch.nn.MSELoss().type(dtype)
     LAMBDA = FLAGS.SES_lambda
 
@@ -142,6 +110,10 @@ def main(argv):
         img_noisy_torch = np_to_torch(attacked_img).type(dtype)
         net_input_saved = net_input.detach().clone()
         noise = net_input.detach().clone()
+
+        print(net_input.shape)
+        print(net_input_saved.shape)
+        print(attacked_img.shape)
 
         # Can probably clean the series thing up a bit more
         def closure(net_input, psnr_max_img, SES_img):
@@ -197,13 +169,22 @@ def main(argv):
             dip_losses.append(dip_loss)
             optimizer.step()
 
-        return psnr_max_img, SES_img, dip_losses
+        return (
+            psnr_max_img,
+            SES_img,
+            {
+                "series": series[::100],
+                "out_series": out_series[::100],
+                "delta_series": delta_series[::100],
+                "dip_losses": dip_losses[::100],
+            },
+        )
 
     # Example pipeline 2:
-    data = get_imagenet_dataset("val")
-    print(f"Validation dataset has {len(data)} items")
-    data.get_dataframe().head()
-    example_dataloader = DataLoader(data, batch_size=1, shuffle=True, drop_last=True)
+    validation_set = get_imagenet_dataset("val")
+    example_dataloader = DataLoader(
+        validation_set, batch_size=1, shuffle=True, drop_last=True
+    )
     tk = torchattacks.PGD(model, eps=0.03, alpha=0.005, steps=40)
     num_attacks_so_far = 0
 
@@ -214,26 +195,56 @@ def main(argv):
         true_y_repr[0, y_example] = 1.0
         adv_image = tk(x_example, true_y_repr)
 
+        print("x_example max,min:", x_example.max().item(), x_example.min().item())
+        print("Current image correct y prediction:", y_example.item())
+
         original_logits = model(x_example)
         adversarial_logits = model(adv_image)
+        print(
+            "Current image original prediction:",
+            torch.argmax(original_logits, dim=1).item(),
+        )
+        print(
+            "Current image adversarial prediction:",
+            torch.argmax(adversarial_logits, dim=1).item(),
+        )
 
         dip_defend_output = dip_defend_per_image(
             copy.deepcopy(dip_net),
             adv_image.detach().cpu().numpy()[0],
         )
-        psnr_max_img, ses_img, dip_losses = dip_defend_output
-        dip_logits_psnrmax = model(psnr_max_img)
-        dip_logits_ses = model(ses_img)
-
-        np.save(
-            os.path.join(FLAGS.save_dir, f"attack_{num_attacks_so_far}_status"),
-            {
-                "original_img": (x_example, original_logits),
-                "attacked_img": (adv_image, adversarial_logits),
-                "psnr_max_defense_img": (psnr_max_img, dip_logits_psnrmax),
-                "ses_defense_img": (ses_img, dip_logits_ses),
-            },
+        psnr_max_img, ses_img, defense_info = dip_defend_output
+        dip_logits_psnrmax = model(
+            torch.from_numpy(psnr_max_img).unsqueeze(0).type(dtype).to(dev)
         )
+        dip_logits_ses = model(
+            torch.from_numpy(ses_img).unsqueeze(0).type(dtype).to(dev)
+        )
+
+        save_destination = os.path.join(
+            FLAGS.save_dir, f"attack_{num_attacks_so_far}_status.pt"
+        )
+        with open(save_destination, "wb") as f:
+            torch.save(
+                {
+                    "original_img": (
+                        x_example.detach().cpu().numpy(),
+                        original_logits.detach().cpu().numpy(),
+                    ),
+                    "attacked_img": (
+                        adv_image.detach().cpu().numpy(),
+                        adversarial_logits.detach().cpu().numpy(),
+                    ),
+                    "psnr_max_defense_img": (
+                        psnr_max_img,
+                        dip_logits_psnrmax.detach().cpu().numpy(),
+                    ),
+                    "ses_defense_img": (ses_img, dip_logits_ses.detach().cpu().numpy()),
+                    "defense_info": defense_info,
+                },
+                f,
+            )
+
         num_attacks_so_far += 1
         if num_attacks_so_far >= FLAGS.attack_length:
             break

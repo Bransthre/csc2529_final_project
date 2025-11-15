@@ -7,6 +7,8 @@ import torch
 import torch.nn as nn
 import torchvision
 from PIL import Image
+from skimage.metrics import peak_signal_noise_ratio as compare_psnr
+from torch.autograd import Variable
 
 
 def crop_image(img, d=32):
@@ -229,3 +231,34 @@ def get_noisy_image(img_np, sigma):
     img_noisy_pil = np_to_pil(img_noisy_np)
 
     return img_noisy_pil, img_noisy_np
+
+
+def preprocess_image(cv2im, resize_im=True):
+    """
+        Processes image for CNNs
+
+    Args:
+        PIL_img (PIL_img): Image to process
+        resize_im (bool): Resize to 224 or not
+    returns:
+        im_as_var (Pytorch variable): Variable that contains processed float tensor
+    """
+
+    im_as_ten = torch.from_numpy(cv2im).float()
+    im_as_ten.unsqueeze_(0)
+    im_as_var = Variable(im_as_ten, requires_grad=False).to(0)
+    return im_as_var
+
+
+def adapative_psnr(img1, img2, size=32):
+    psnr, area_cnt = [], 0
+    _, h, w = img1.shape
+
+    for i in range(int(h // size)):
+        for j in range(int(w // size)):
+            img1_part = img1[:, i * size : (i + 1) * size, j * size : (j + 1) * size]
+            img2_part = img2[:, i * size : (i + 1) * size, j * size : (j + 1) * size]
+            psnr.append(compare_psnr(img1_part, img2_part))
+            area_cnt += 1
+    psnr = np.array(psnr).min()
+    return psnr
