@@ -4,11 +4,12 @@ import matplotlib.pyplot as plt
 import numpy as np
 import PIL
 import torch
-import torch.nn as nn
 import torchvision
 from PIL import Image
 from skimage.metrics import peak_signal_noise_ratio as compare_psnr
 from torch.autograd import Variable
+
+from idip_defend.models.skip import skip
 
 
 def crop_image(img, d=32):
@@ -262,3 +263,47 @@ def adapative_psnr(img1, img2, size=32):
             area_cnt += 1
     psnr = np.array(psnr).min()
     return psnr
+
+
+def inform_about_attack(original_logits, adversarial_logits, y_example):
+    print("Current image correct y prediction:", y_example.item())
+    print(
+        "Current image original prediction:",
+        torch.argmax(original_logits, dim=1).item(),
+    )
+    print(
+        "Current image adversarial prediction:",
+        torch.argmax(adversarial_logits, dim=1).item(),
+    )
+
+
+def get_net_from_domain(image_domain):
+    if image_domain == "cifar":
+        input_depth = 1
+        num_iter = 1200
+        dip_net = skip(
+            num_input_channels=input_depth,
+            num_output_channels=3,
+            num_channels_down=[16, 32, 64, 128],
+            num_channels_up=[16, 32, 64, 128],
+            num_channels_skip=[4, 4, 4, 4],
+            upsample_mode="nearest",
+            need_sigmoid=False,
+            pad="reflection",
+            act_fun="LeakyReLU",
+        )
+    elif image_domain == "imagenet":
+        input_depth = 3
+        num_iter = 2400
+        dip_net = skip(
+            num_input_channels=input_depth,
+            num_output_channels=3,
+            num_channels_down=[16, 32, 64, 128, 128],
+            num_channels_up=[16, 32, 64, 128, 128],
+            num_channels_skip=[4, 4, 4, 4, 4],
+            upsample_mode="nearest",
+            need_sigmoid=False,  # remove
+            pad="reflection",
+            act_fun="LeakyReLU",
+        )
+    return dip_net, {"input_depth": input_depth, "num_iter": num_iter}
