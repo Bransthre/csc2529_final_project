@@ -1,6 +1,7 @@
 import copy
 import os
 import pickle
+import warnings
 
 import numpy as np
 import torch
@@ -25,6 +26,8 @@ from idip_defend.utils.imagenet.dataset_utils import (
     transform_layer,
 )
 
+warnings.simplefilter("ignore")
+
 FLAGS = flags.FLAGS
 flags.DEFINE_string(
     "target_img_domain",
@@ -36,6 +39,11 @@ flags.DEFINE_string(
     "save_dir",
     default="./script_logpoint",
     help="The directory used to save the output",
+)
+flags.DEFINE_boolean(
+    "update_ewc_after_defense",
+    default=False,
+    help="Whether to update EWC after each defense",
 )
 flags.DEFINE_float("SES_lambda", default=0.002, help="Hyperparameter of SES")
 flags.DEFINE_integer("attack_length", default=5, help="Length of attack sequence")
@@ -56,18 +64,17 @@ def fake_attack_using_uniform_noise(img, _):
 
 # Per-image routine
 def dip_defend_per_image(
-    per_image_dip_net,
+    per_image_dip_net: nn.Sequential,
     attacked_img,
     num_iter,
     input_depth,
     ses_parameter,
     dip_objective: EWC,
+    reg_noise_std=1.0 / 30.0,
     past_examples=[],
 ):
     series, out_series, delta_series = [], [], []
     psnr_max_img, SES_img = None, None
-
-    reg_noise_std = 1.0 / 30.0
     net_input = (
         get_noise(input_depth, "noise", attacked_img.shape[1:]).type(dtype).detach()
     )
@@ -77,28 +84,22 @@ def dip_defend_per_image(
     net_input_saved = net_input.detach().clone()
     noise = net_input.detach().clone()
 
-    past_example_net_inputs = []
-    for past_example in past_examples:
-        past_net_input = (
-            get_noise(input_depth, "noise", past_example.shape[1:]).type(dtype).detach()
-        )
-        past_example_net_inputs.append(past_net_input)
     past_example_losses = [[] for _ in range(len(past_examples))]
 
     def evaluate_past_examples():
-        with torch.no_grad():
-            for idx, past_example in enumerate(past_examples):
-                if reg_noise_std > 0:
-                    past_example_net_input = past_example_net_inputs[idx]
-                    past_example_net_input = past_example_net_input + (
-                        noise.normal_() * reg_noise_std
-                    )
-                past_out = per_image_dip_net(past_example_net_input)
-                past_example_loss = mse_loss(
-                    past_out.mean(dim=0, keepdim=True),
-                    np_to_torch(past_example).type(dtype),
-                )
-                past_example_losses[idx].append(past_example_loss.item())
+        for idx, past_example in enumerate(past_examples):
+            if reg_noise_std > 0:
+                past_example_net_input = (
+                    get_noise(input_depth, "noise", past_example.shape[1:])
+                    .type(dtype)
+                    .detach()
+                ) + (noise.normal_() * reg_noise_std)
+            past_out = per_image_dip_net(past_example_net_input)
+            past_example_loss = mse_loss(
+                past_out.mean(dim=0, keepdim=True),
+                np_to_torch(past_example).type(dtype),
+            )
+            past_example_losses[idx].append(past_example_loss.item())
 
     # Can probably clean the series thing up a bit more
     def closure(net_input, psnr_max_img, SES_img):
@@ -110,7 +111,7 @@ def dip_defend_per_image(
         total_loss = dip_objective(
             out.mean(dim=0, keepdim=True),
             img_noisy_torch,
-            per_image_dip_net.parameters(),
+            list(per_image_dip_net.parameters()),
         )
         total_loss.backward()
         psrn_gt = adapative_psnr(attacked_img, out.detach().cpu().numpy().mean(axis=0))
@@ -140,12 +141,11 @@ def dip_defend_per_image(
             if series[-1] > np.array(series[:-1]).max():
                 psnr_max_img = out.detach().cpu().numpy().mean(axis=0)
 
-        evaluate_past_examples()
+        with torch.no_grad():
+            evaluate_past_examples()
+
         return total_loss, (net_input, psnr_max_img, SES_img)
 
-    # Compute number of parameters
-    s = sum([np.prod(list(p.size())) for p in per_image_dip_net.parameters()])
-    print("Number of params: %d" % s)
     total_params = get_params("net,input", per_image_dip_net, net_input)
 
     optimizer = torch.optim.Adam(total_params, lr=0.01)
@@ -157,6 +157,11 @@ def dip_defend_per_image(
         )
         dip_losses.append(dip_loss)
         optimizer.step()
+
+    if (
+        SES_img is None
+    ):  # I don't think this should happen but this is the conceptual insurance.
+        SES_img = psnr_max_img
 
     return (
         psnr_max_img,
@@ -198,12 +203,14 @@ def main(argv):
     example_dataloader = DataLoader(
         validation_set, batch_size=1, shuffle=True, drop_last=True
     )
-    tk = fake_attack_using_uniform_noise
+    tk = torchattacks.PGD(model, eps=0.03, alpha=0.005, steps=40)
+
     num_attacks_so_far = 0
     ses_parameter = FLAGS.SES_lambda
     prev_x_examples = []
     dip_objective = EWC(
-        main_task_objective=torch.nn.MSELoss().type(dtype), past_task_weight=1.0
+        main_task_objective=torch.nn.MSELoss().type(dtype),
+        past_task_weight=0.5,
     ).to(dev)
 
     for x_example, y_example in example_dataloader:
@@ -217,6 +224,9 @@ def main(argv):
         inform_about_attack(original_logits, adversarial_logits, y_example)
 
         adv_image_input = adv_image.detach().cpu().numpy()[0]
+        # Compute number of parameters
+        s = sum([np.prod(list(p.size())) for p in dip_net.parameters()])
+        print("Number of params: %d" % s)
 
         dip_defend_output = dip_defend_per_image(
             per_image_dip_net=dip_net,  # This net will be updated constantly
@@ -234,8 +244,6 @@ def main(argv):
         dip_logits_ses = model(
             torch.from_numpy(ses_img).unsqueeze(0).type(dtype).to(dev)
         )
-
-        # TODO: Build a composeable module here that does EWC using the parameters.
 
         save_destination = os.path.join(
             FLAGS.save_dir, f"attack_{num_attacks_so_far}_status.pt"
@@ -263,17 +271,34 @@ def main(argv):
 
         num_attacks_so_far += 1
         prev_x_examples.append(adv_image_input)
-        dip_objective.expand_examples(
-            new_params=list(dip_net.parameters()),
-            new_loss=mse_loss(
-                torch.from_numpy(ses_img).unsqueeze(0).type(dtype).to(dev),
-                adv_image.type(dtype).to(dev),
-            ),
-        )
+        if FLAGS.update_ewc_after_defense:
+            net_input = (
+                get_noise(input_depth, "noise", adv_image_input.shape[1:])
+                .type(dtype)
+                .detach()
+            )
+            img_noisy_torch = np_to_torch(adv_image_input).type(dtype)
+            net_input_saved = net_input.detach().clone()
+            noise = net_input.detach().clone()
+            net_input = net_input_saved + (noise.normal_() * 1 / 30.0)
+            out = dip_net(net_input)
+
+            final_dip_loss = (
+                (out.mean(dim=0, keepdim=True) - img_noisy_torch).pow(2).mean()
+            )
+
+            net_params = list(dip_net.parameters())
+            dip_objective.expand_examples(net_params, final_dip_loss)
+            # task_grads = [
+            #     torch.autograd.grad(final_dip_loss, param, retain_graph=True)[0]
+            #     for param in net_params
+            # ]
+            # task_fisher_diags = [grad.pow(2).detach() for grad in task_grads]
+            # dip_objective.past_tasks.append((dip_net.parameters(), task_fisher_diags))
+
         if num_attacks_so_far >= FLAGS.attack_length:
             break
 
 
 if __name__ == "__main__":
-    app.run(main)
     app.run(main)

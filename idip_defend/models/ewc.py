@@ -19,7 +19,8 @@ class EWC(nn.Module):
     def expand_examples(self, new_params, new_loss):
         # do something, should take the parameter and consider the fisher
         task_grads = [
-            torch.autograd.grad(new_loss, new_param)[0] for new_param in new_params
+            torch.autograd.grad(new_loss, new_param, retain_graph=True)[0]
+            for new_param in new_params
         ]
         task_fisher_diags = [grad.pow(2).detach() for grad in task_grads]
         self.past_tasks.append((new_params, task_fisher_diags))
@@ -30,16 +31,25 @@ class EWC(nn.Module):
         target_img: torch.Tensor,
         input_net_params: List,
     ) -> torch.Tensor:
-        subtask_losses = []
-        for task_id, (task_params, task_fisher_diags) in self.past_tasks.items():
-            # compute EWC loss
-            subtask_loss_over_params = []
-            for param, diag in zip(task_params, task_fisher_diags):
-                subtask_loss_over_params.append(
-                    (diag * (param - input_net_params[param]).pow(2)).sum()
-                )
-            subtask_losses.append(subtask_loss_over_params.sum())
         total_loss = self.main_task_objective(input_img, target_img)
-        if subtask_losses:
-            total_loss += self.past_task_weight * sum(subtask_losses)
-        return total_loss
+        if not self.past_tasks:
+            return total_loss
+
+        subtask_losses = torch.tensor([]).to(total_loss.device)
+        for task_params, task_fisher_diags in self.past_tasks:
+            # compute EWC loss
+            subtask_loss_over_params = torch.tensor(0.0).to(total_loss.device)
+            for input_param, task_param, diag in zip(
+                input_net_params, task_params, task_fisher_diags
+            ):
+                subtask_loss_over_params += (
+                    diag * (input_param - task_param).pow(2)
+                ).sum()
+
+            subtask_losses = torch.cat(
+                (
+                    subtask_losses,
+                    torch.sum(subtask_loss_over_params).unsqueeze(0),
+                )
+            )
+        return total_loss + self.past_task_weight * torch.sum(subtask_losses)
