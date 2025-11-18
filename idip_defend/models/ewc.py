@@ -16,14 +16,29 @@ class EWC(nn.Module):
         self.past_tasks: List[Any, torch.Tensor] = []
         self.past_task_weight = past_task_weight
 
-    def expand_examples(self, new_params, new_loss):
+    def _detach_and_clone(self, lst):
+        return [item.detach().clone() for item in lst]
+
+    def expand_examples(self, prev_task_params, prev_task_loss):
         # do something, should take the parameter and consider the fisher
         task_grads = [
-            torch.autograd.grad(new_loss, new_param, retain_graph=True)[0]
-            for new_param in new_params
+            torch.autograd.grad(prev_task_loss, new_param, retain_graph=True)[0]
+            for new_param in prev_task_params
         ]
-        task_fisher_diags = [grad.pow(2).detach() for grad in task_grads]
-        self.past_tasks.append((new_params, task_fisher_diags))
+        # task_fisher_diags = [grad.pow(2) for grad in task_grads]
+        # task_fisher_diags_means = torch.stack([f.mean() for f in task_fisher_diags])
+        # task_fisher_diags_scale = 1.0 / (task_fisher_diags_means.mean() + 1e-12)
+        # task_fisher_diags = [f * task_fisher_diags_scale for f in task_fisher_diags]
+        task_fisher_diags = [
+            torch.tensor(1.0).to(prev_task_params[0].device) for _ in task_grads
+        ]
+
+        self.past_tasks.append(
+            (
+                self._detach_and_clone(prev_task_params),
+                self._detach_and_clone(task_fisher_diags),
+            )
+        )
 
     def forward(
         self,
@@ -31,25 +46,16 @@ class EWC(nn.Module):
         target_img: torch.Tensor,
         input_net_params: List,
     ) -> torch.Tensor:
-        total_loss = self.main_task_objective(input_img, target_img)
+        task_objective = self.main_task_objective(input_img, target_img)
         if not self.past_tasks:
-            return total_loss
+            return task_objective
 
-        subtask_losses = torch.tensor([]).to(total_loss.device)
+        subtask_loss = torch.tensor(0.0, device=task_objective.device)
+        num_attacks_so_far = len(self.past_tasks)
         for task_params, task_fisher_diags in self.past_tasks:
-            # compute EWC loss
-            subtask_loss_over_params = torch.tensor(0.0).to(total_loss.device)
             for input_param, task_param, diag in zip(
                 input_net_params, task_params, task_fisher_diags
             ):
-                subtask_loss_over_params += (
-                    diag * (input_param - task_param).pow(2)
-                ).sum()
+                subtask_loss += (diag * (input_param - task_param).pow(2)).sum()
 
-            subtask_losses = torch.cat(
-                (
-                    subtask_losses,
-                    torch.sum(subtask_loss_over_params).unsqueeze(0),
-                )
-            )
-        return total_loss + self.past_task_weight * torch.sum(subtask_losses)
+        return task_objective + self.past_task_weight * subtask_loss
