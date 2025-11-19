@@ -314,17 +314,21 @@ def spectral_anchoring_loss(mask_alpha, img_hw, device):
     fy = torch.fft.fftfreq(H, device=device).reshape(-1, 1)
     fx = torch.fft.fftfreq(W, device=device).reshape(1, -1)
     fr = torch.sqrt(fx**2 + fy**2)
-    fourier_mask = torch.exp(-mask_alpha * (fr**2))
+    fourier_mask = torch.exp(-mask_alpha * (fr**2)).unsqueeze(0)
 
-    def _spectral_anchoring_loss(output, target):
-        fourier_output = torch.fft.rfft2(output)
-        fourier_target = torch.fft.rfft2(target)
+    def _spectral_anchoring_loss(_, target, net_output):
+        fourier_output = torch.fft.fft2(net_output).squeeze()
+        fourier_target = torch.fft.fft2(target).squeeze()
         fourier_weighted_diff = (fourier_output - fourier_target) * fourier_mask
-        loss = (torch.abs(fourier_weighted_diff)).pow(2).mean()
-        return loss
+        spectral_loss = torch.abs(fourier_weighted_diff).pow(2).mean()
+        return spectral_loss * 0.005  # scale down
 
     return _spectral_anchoring_loss
 
 
-def fake_loss(device, *args):
-    return torch.tensor(0.0, device=device)
+def fake_loss(device):
+
+    def _fake_loss(*args, **kwargs):
+        return torch.tensor(0.0, device=device)
+
+    return _fake_loss

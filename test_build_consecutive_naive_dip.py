@@ -89,6 +89,7 @@ def train_dip_on_image(
     anchoring_loss_fn,
     reg_noise_std=1.0 / 30.0,
     past_examples=[],
+    past_defenses=[],
 ):
     series, out_series, delta_series = [], [], []
     psnr_max_img, SES_img = None, None
@@ -103,13 +104,15 @@ def train_dip_on_image(
 
     past_example_losses = [[] for _ in past_examples]
 
-    def get_past_example_loss(past_example, anchoring_loss_fn):
+    def get_past_example_loss(past_example, past_defense, anchoring_loss_fn):
         past_example_out = dip_output_of_image(
             per_image_dip_net, past_example, input_depth, reg_noise_std
         )
         past_example_noisy_torch = np_to_torch(past_example).type(dtype)
+        past_defense_noisy_torch = np_to_torch(past_defense).type(dtype)
         past_example_loss = anchoring_loss_fn(
             past_example_noisy_torch,
+            past_defense_noisy_torch,
             past_example_out.mean(dim=0, keepdim=True),
         )
         return past_example_loss, past_example_out
@@ -130,8 +133,8 @@ def train_dip_on_image(
         past_example_outs = []
 
         for idx, past_example in enumerate(past_examples):
-            past_example_out, past_example_anchoring_loss = get_past_example_loss(
-                past_example, anchoring_loss_fn
+            past_example_anchoring_loss, past_example_out = get_past_example_loss(
+                past_example, past_defenses[idx], anchoring_loss_fn
             )
             past_example_outs.append(past_example_out)
             past_example_losses[idx].append(past_example_anchoring_loss.item())
@@ -226,7 +229,7 @@ def main(argv):
     tk = torchattacks.PGD(resnet_classifier, eps=0.03, alpha=0.005, steps=40)
 
     if FLAGS.anchoring_loss_fn == "mse":
-        anchoring_loss_fn = mse_loss
+        anchoring_loss_fn = lambda attack, defense, output: mse_loss(output, attack)
     elif FLAGS.anchoring_loss_fn == "spectral":
         anchoring_loss_fn = spectral_anchoring_loss(
             FLAGS.fourier_mask_alpha, (224, 224), dev
@@ -241,6 +244,7 @@ def main(argv):
     num_attacks_so_far = 0
     ses_parameter = FLAGS.SES_lambda
     prev_x_examples = []
+    prev_ses_imgs = []
     dip_objective = EWC(
         main_task_objective=mse_loss,
         past_task_weight=FLAGS.past_task_weight,
@@ -267,6 +271,7 @@ def main(argv):
             dip_objective=dip_objective,
             anchoring_loss_fn=anchoring_loss_fn,
             past_examples=prev_x_examples,
+            past_defenses=prev_ses_imgs,
         )
         psnr_max_img, ses_img, defense_info = dip_defend_output
         dip_logits_psnrmax = resnet_classifier(
@@ -317,6 +322,7 @@ def main(argv):
 
         num_attacks_so_far += 1
         prev_x_examples.append(adv_image_input)
+        prev_ses_imgs.append(ses_img)
         if FLAGS.update_ewc_after_defense:
             net_input = (
                 get_noise(input_depth, "noise", adv_image_input.shape[1:])
