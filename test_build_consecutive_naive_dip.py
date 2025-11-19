@@ -15,11 +15,13 @@ from tqdm import tqdm
 from idip_defend.models.ewc import EWC
 from idip_defend.utils.common_utils import (
     adapative_psnr,
+    fake_loss,
     get_net_from_domain,
     get_noise,
     get_params,
     inform_about_attack,
     np_to_torch,
+    spectral_anchoring_loss,
 )
 from idip_defend.utils.imagenet.dataset_utils import (
     get_imagenet_dataset,
@@ -48,6 +50,8 @@ flags.DEFINE_boolean(
 flags.DEFINE_float("SES_lambda", default=0.002, help="Hyperparameter of SES")
 flags.DEFINE_integer("attack_length", default=5, help="Length of attack sequence")
 flags.DEFINE_float("past_task_weight", default=1.0, help="Weight for past tasks in EWC")
+flags.DEFINE_string("anchoring_loss_fn", default="mse", help="Anchoring loss function")
+flags.DEFINE_float("fourier_mask_alpha", default=10.0, help="Alpha for fourier mask")
 
 torch.backends.cudnn.enabled = True
 torch.backends.cudnn.benchmark = True
@@ -55,22 +59,34 @@ dtype = torch.cuda.FloatTensor
 mse_loss = torch.nn.MSELoss().type(dtype)
 
 
-def fake_attack_using_uniform_noise(img, _):
-    noise_magnitude = np.random.uniform(0, 0.1)
-    noise = np.random.uniform(-noise_magnitude, noise_magnitude, img.shape)
-    attacked_img = img + noise
-    attacked_img = np.clip(attacked_img, 0.0, 1.0)
-    return attacked_img
+def dip_output_of_image(
+    per_image_dip_net: nn.Sequential,
+    attacked_img,
+    input_depth,
+    reg_noise_std=1.0 / 30.0,
+):
+    net_input = (
+        get_noise(input_depth, "noise", attacked_img.shape[1:]).type(dtype).detach()
+    )
+
+    net_input_saved = net_input.detach().clone()
+    noise = net_input.detach().clone()
+    if reg_noise_std > 0:
+        net_input = net_input_saved + (noise.normal_() * reg_noise_std)
+    out = per_image_dip_net(net_input)
+
+    return out.mean(axis=0, keepdims=True)
 
 
 # Per-image routine
-def dip_defend_per_image(
+def train_dip_on_image(
     per_image_dip_net: nn.Sequential,
     attacked_img,
     num_iter,
     input_depth,
     ses_parameter,
     dip_objective: EWC,
+    anchoring_loss_fn,
     reg_noise_std=1.0 / 30.0,
     past_examples=[],
 ):
@@ -85,34 +101,18 @@ def dip_defend_per_image(
     net_input_saved = net_input.detach().clone()
     noise = net_input.detach().clone()
 
-    past_example_losses = [[] for _ in range(len(past_examples))]
+    past_example_losses = [[] for _ in past_examples]
 
-    def evaluate_past_examples():
-        past_outs = []
-
-        # TODO: Try making this run faster
-        for idx, past_example in enumerate(past_examples):
-            past_example_net_input = (
-                get_noise(input_depth, "noise", past_example.shape[1:])
-                .type(dtype)
-                .detach()
-            )
-            past_example_noisy_torch = np_to_torch(past_example).type(dtype)
-            past_example_net_input_saved = past_example_net_input.detach().clone()
-            past_example_noise = past_example_net_input.detach().clone()
-
-            if reg_noise_std > 0:
-                past_example_net_input = past_example_net_input_saved + (
-                    past_example_noise.normal_() * reg_noise_std
-                )
-            past_example_out = per_image_dip_net(past_example_net_input)
-            past_example_loss = mse_loss(
-                past_example_noisy_torch,
-                past_example_out.mean(dim=0, keepdim=True),
-            )
-            past_example_losses[idx].append(past_example_loss.item())
-            past_outs.append(past_example_out.detach().cpu().numpy().mean(axis=0))
-        return past_outs
+    def get_past_example_loss(past_example, anchoring_loss_fn):
+        past_example_out = dip_output_of_image(
+            per_image_dip_net, past_example, input_depth, reg_noise_std
+        )
+        past_example_noisy_torch = np_to_torch(past_example).type(dtype)
+        past_example_loss = anchoring_loss_fn(
+            past_example_noisy_torch,
+            past_example_out.mean(dim=0, keepdim=True),
+        )
+        return past_example_loss, past_example_out
 
     # Can probably clean the series thing up a bit more
     def closure(net_input, psnr_max_img, SES_img):
@@ -126,6 +126,17 @@ def dip_defend_per_image(
             out.mean(dim=0, keepdim=True),
             list(per_image_dip_net.parameters()),
         )
+
+        past_example_outs = []
+
+        for idx, past_example in enumerate(past_examples):
+            past_example_out, past_example_anchoring_loss = get_past_example_loss(
+                past_example, anchoring_loss_fn
+            )
+            past_example_outs.append(past_example_out)
+            past_example_losses[idx].append(past_example_anchoring_loss.item())
+            total_loss += past_example_anchoring_loss
+
         total_loss.backward()
         psrn_gt = adapative_psnr(attacked_img, out.detach().cpu().numpy().mean(axis=0))
 
@@ -154,10 +165,7 @@ def dip_defend_per_image(
             if series[-1] > np.array(series[:-1]).max():
                 psnr_max_img = out.detach().cpu().numpy().mean(axis=0)
 
-        with torch.no_grad():
-            past_outs = evaluate_past_examples()
-
-        return total_loss, (net_input, psnr_max_img, SES_img), past_outs
+        return total_loss, (net_input, psnr_max_img, SES_img), past_example_outs
 
     total_params = get_params("net,input", per_image_dip_net, net_input)
 
@@ -171,9 +179,7 @@ def dip_defend_per_image(
         dip_losses.append(dip_loss)
         optimizer.step()
 
-    if (
-        SES_img is None
-    ):  # I don't think this should happen but this is the conceptual insurance.
+    if SES_img is None:
         SES_img = psnr_max_img
 
     return (
@@ -204,9 +210,9 @@ def main(argv):
     # Image loading
     resnet50 = models.resnet50(pretrained=True).to(dev)
     resnet50.eval()
-    model = copy.deepcopy(resnet50)
-    model = nn.Sequential(transform_layer(), model)
-    model.eval()
+    resnet_classifier = copy.deepcopy(resnet50)
+    resnet_classifier = nn.Sequential(transform_layer(), resnet_classifier)
+    resnet_classifier.eval()
 
     dip_net, net_info = get_net_from_domain(FLAGS.target_img_domain)
     input_depth = net_info["input_depth"]
@@ -217,7 +223,20 @@ def main(argv):
     example_dataloader = DataLoader(
         validation_set, batch_size=1, shuffle=True, drop_last=True
     )
-    tk = torchattacks.PGD(model, eps=0.03, alpha=0.005, steps=40)
+    tk = torchattacks.PGD(resnet_classifier, eps=0.03, alpha=0.005, steps=40)
+
+    if FLAGS.anchoring_loss_fn == "mse":
+        anchoring_loss_fn = mse_loss
+    elif FLAGS.anchoring_loss_fn == "spectral":
+        anchoring_loss_fn = spectral_anchoring_loss(
+            FLAGS.fourier_mask_alpha, (224, 224), dev
+        )
+    elif FLAGS.anchoring_loss_fn == "fake":
+        anchoring_loss_fn = fake_loss(dev)
+    else:
+        raise ValueError(
+            f"Unsupported anchoring loss function: {FLAGS.anchoring_loss_fn}"
+        )
 
     num_attacks_so_far = 0
     ses_parameter = FLAGS.SES_lambda
@@ -233,29 +252,44 @@ def main(argv):
         true_y_repr = torch.zeros(1, 1000).to(dev)
         true_y_repr[0, y_example] = 1.0
         adv_image = tk(x_example, true_y_repr)
-        original_logits = model(x_example)
-        adversarial_logits = model(adv_image)
+        original_logits = resnet_classifier(x_example)
+        adversarial_logits = resnet_classifier(adv_image)
         inform_about_attack(original_logits, adversarial_logits, y_example)
 
         adv_image_input = adv_image.detach().cpu().numpy()[0]
 
-        dip_defend_output = dip_defend_per_image(
+        dip_defend_output = train_dip_on_image(
             per_image_dip_net=dip_net,  # This net will be updated constantly
             attacked_img=adv_image_input,
             num_iter=num_iter,
             input_depth=input_depth,
             ses_parameter=ses_parameter,
             dip_objective=dip_objective,
+            anchoring_loss_fn=anchoring_loss_fn,
             past_examples=prev_x_examples,
         )
         psnr_max_img, ses_img, defense_info = dip_defend_output
-        dip_logits_psnrmax = model(
+        dip_logits_psnrmax = resnet_classifier(
             torch.from_numpy(psnr_max_img).unsqueeze(0).type(dtype).to(dev)
         )
-        dip_logits_ses = model(
+        dip_logits_ses = resnet_classifier(
             torch.from_numpy(ses_img).unsqueeze(0).type(dtype).to(dev)
         )
 
+        # Evaluate logits for past examples
+        print("Evaluating past examples...")
+        past_examples_logits = []
+        with torch.no_grad():
+            for idx, past_example in enumerate(prev_x_examples):
+                past_examples_defended = dip_output_of_image(
+                    dip_net, past_example, input_depth
+                )
+                past_example_defended_logits = resnet_classifier(past_examples_defended)
+                past_examples_logits.append(
+                    past_example_defended_logits.detach().cpu().numpy()
+                )
+
+        print("Saving defense results...")
         save_destination = os.path.join(
             FLAGS.save_dir, f"attack_{num_attacks_so_far}_status.pt"
         )
@@ -276,6 +310,7 @@ def main(argv):
                     ),
                     "ses_defense_img": (ses_img, dip_logits_ses.detach().cpu().numpy()),
                     "defense_info": defense_info,
+                    "past_examples_logits": past_examples_logits,
                 },
                 f,
             )
