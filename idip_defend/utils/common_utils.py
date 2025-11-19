@@ -309,21 +309,33 @@ def get_net_from_domain(image_domain):
     return dip_net, {"input_depth": input_depth, "num_iter": num_iter}
 
 
-def spectral_anchoring_loss(mask_alpha, img_hw, device):
+def spectral_anchoring_loss(mask_alpha, img_hw, device, anchor_to="defense"):
     H, W = img_hw
     fy = torch.fft.fftfreq(H, device=device).reshape(-1, 1)
     fx = torch.fft.fftfreq(W, device=device).reshape(1, -1)
     fr = torch.sqrt(fx**2 + fy**2)
     fourier_mask = torch.exp(-mask_alpha * (fr**2)).unsqueeze(0)
 
-    def _spectral_anchoring_loss(_, target, net_output):
+    def _spectral_anchoring_loss_def(attack_img, defense_img, net_output):
+        target = defense_img
         fourier_output = torch.fft.fft2(net_output).squeeze()
         fourier_target = torch.fft.fft2(target).squeeze()
         fourier_weighted_diff = (fourier_output - fourier_target) * fourier_mask
         spectral_loss = torch.abs(fourier_weighted_diff).pow(2).mean()
         return spectral_loss * 0.005  # scale down
 
-    return _spectral_anchoring_loss
+    def _spectral_anchoring_loss_att(attack_img, defense_img, net_output):
+        target = attack_img
+        fourier_output = torch.fft.fft2(net_output).squeeze()
+        fourier_target = torch.fft.fft2(target).squeeze()
+        fourier_weighted_diff = (fourier_output - fourier_target) * fourier_mask
+        spectral_loss = torch.abs(fourier_weighted_diff).pow(2).mean()
+        return spectral_loss * 0.005  # scale down
+
+    if anchor_to == "defense":
+        return _spectral_anchoring_loss_def
+    else:
+        return _spectral_anchoring_loss_att
 
 
 def fake_loss(device):

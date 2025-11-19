@@ -43,7 +43,7 @@ flags.DEFINE_string(
     help="The directory used to save the output",
 )
 flags.DEFINE_boolean(
-    "update_ewc_after_defense",
+    "update_ewc",
     default=False,
     help="Whether to update EWC after each defense",
 )
@@ -51,6 +51,11 @@ flags.DEFINE_float("SES_lambda", default=0.002, help="Hyperparameter of SES")
 flags.DEFINE_integer("attack_length", default=5, help="Length of attack sequence")
 flags.DEFINE_float("past_task_weight", default=1.0, help="Weight for past tasks in EWC")
 flags.DEFINE_string("anchoring_loss_fn", default="mse", help="Anchoring loss function")
+flags.DEFINE_string(
+    "anchor_to",
+    default="defense",
+    help="Whether to anchor to 'defense' or 'attack' images in spectral loss",
+)
 flags.DEFINE_float("fourier_mask_alpha", default=10.0, help="Alpha for fourier mask")
 
 torch.backends.cudnn.enabled = True
@@ -103,6 +108,8 @@ def train_dip_on_image(
     noise = net_input.detach().clone()
 
     past_example_losses = [[] for _ in past_examples]
+    past_attack_output_mses = [[] for _ in past_examples]
+    past_defense_output_mses = [[] for _ in past_examples]
 
     def get_past_example_loss(past_example, past_defense, anchoring_loss_fn):
         past_example_out = dip_output_of_image(
@@ -115,7 +122,21 @@ def train_dip_on_image(
             past_defense_noisy_torch,
             past_example_out.mean(dim=0, keepdim=True),
         )
-        return past_example_loss, past_example_out
+        with torch.no_grad():
+            attack_output_mse = (
+                (past_example_out.mean(dim=0, keepdim=True) - past_example_noisy_torch)
+                .pow(2)
+                .mean()
+            )
+            defense_output_mse = (
+                (past_defense_noisy_torch - past_example_noisy_torch).pow(2).mean()
+            )
+        return (
+            past_example_loss,
+            past_example_out,
+            attack_output_mse,
+            defense_output_mse,
+        )
 
     # Can probably clean the series thing up a bit more
     def closure(net_input, psnr_max_img, SES_img):
@@ -123,7 +144,6 @@ def train_dip_on_image(
             net_input = net_input_saved + (noise.normal_() * reg_noise_std)
 
         out = per_image_dip_net(net_input)
-
         total_loss = dip_objective(
             img_noisy_torch,
             out.mean(dim=0, keepdim=True),
@@ -133,11 +153,18 @@ def train_dip_on_image(
         past_example_outs = []
 
         for idx, past_example in enumerate(past_examples):
-            past_example_anchoring_loss, past_example_out = get_past_example_loss(
+            (
+                past_example_anchoring_loss,
+                past_example_out,
+                attack_output_mse,
+                defense_output_mse,
+            ) = get_past_example_loss(
                 past_example, past_defenses[idx], anchoring_loss_fn
             )
             past_example_outs.append(past_example_out)
             past_example_losses[idx].append(past_example_anchoring_loss.item())
+            past_attack_output_mses[idx].append(attack_output_mse.item())
+            past_defense_output_mses[idx].append(defense_output_mse.item())
             total_loss += past_example_anchoring_loss
 
         total_loss.backward()
@@ -204,6 +231,11 @@ def main(argv):
     print("Torch", torch.__version__, "CUDA", torch.version.cuda)
     print("Device:", torch.device("cuda:0"))
 
+    assert FLAGS.anchor_to in [
+        "defense",
+        "attack",
+    ], f"Invalid anchor_to value: {FLAGS.anchor_to}. Must be 'defense' or 'attack'."
+
     if torch.cuda.is_available():
         dev = torch.device("cuda")
     else:
@@ -232,7 +264,7 @@ def main(argv):
         anchoring_loss_fn = lambda attack, defense, output: mse_loss(output, attack)
     elif FLAGS.anchoring_loss_fn == "spectral":
         anchoring_loss_fn = spectral_anchoring_loss(
-            FLAGS.fourier_mask_alpha, (224, 224), dev
+            FLAGS.fourier_mask_alpha, (224, 224), dev, anchor_to=FLAGS.anchor_to
         )
     elif FLAGS.anchoring_loss_fn == "fake":
         anchoring_loss_fn = fake_loss(dev)
@@ -295,6 +327,7 @@ def main(argv):
                 )
 
         print("Saving defense results...")
+        os.makedirs(FLAGS.save_dir, exist_ok=True)
         save_destination = os.path.join(
             FLAGS.save_dir, f"attack_{num_attacks_so_far}_status.pt"
         )
@@ -323,7 +356,7 @@ def main(argv):
         num_attacks_so_far += 1
         prev_x_examples.append(adv_image_input)
         prev_ses_imgs.append(ses_img)
-        if FLAGS.update_ewc_after_defense:
+        if FLAGS.update_ewc:
             net_input = (
                 get_noise(input_depth, "noise", adv_image_input.shape[1:])
                 .type(dtype)
