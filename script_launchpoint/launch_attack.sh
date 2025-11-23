@@ -5,19 +5,23 @@
 
 source /home/bransthr/.envs/csc2529/bin/activate
 
-export TARGET_IMG_DOMAIN=$1
-export SAVE_DIR=$2
-export ATTACK_LENGTH=$3
-export UPDATE_EWC=$4
-export ANCHORING_LOSS_FN=$5
-export ANCHOR_TO=$6
-export ANCHORING_LOSS_WEIGHT=$7
+export SAVE_DIR=$1
+export UPDATE_EWC=$2
+export ANCHORING_LOSS_FN=$3
+export MASK_ALPHA=$4
+export ANCHORING_LOSS_WEIGHT=$5
+export RETRAIN_DIP_EVERY_ATTACK=$6
+export ANCHOR_WITH_PAST_EXAMPLES=$7
+export NUM_ITER_PER_IMAGE=$8
 
 python test_build_consecutive_naive_dip.py \
-    --target_img_domain $TARGET_IMG_DOMAIN \
+    --target_img_domain imagenet \
+    --attack_length 50 \
     --save_dir $SAVE_DIR \
-    --attack_length $ATTACK_LENGTH \
     --update_ewc $UPDATE_EWC \
     --anchoring_loss_fn $ANCHORING_LOSS_FN \
-    --anchor_to $ANCHOR_TO \
-    --anchoring_loss_weight $ANCHORING_LOSS_WEIGHT
+    --fourier_mask_alpha $MASK_ALPHA \
+    --anchoring_loss_weight $ANCHORING_LOSS_WEIGHT \
+    --retrain_dip_every_attack $RETRAIN_DIP_EVERY_ATTACK \
+    --anchor_with_past_examples $ANCHOR_WITH_PAST_EXAMPLES \
+    --num_iter_per_image $NUM_ITER_PER_IMAGE

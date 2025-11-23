@@ -320,16 +320,16 @@ def spectral_anchoring_loss(mask_alpha, img_hw, device, anchor_to="defense"):
         target = defense_img
         fourier_target = torch.fft.fft2(target).squeeze()
         fourier_output = torch.fft.fft2(net_output).squeeze()
-        fourier_weighted_diff = (fourier_output - fourier_target) * fourier_mask
-        spectral_loss = torch.abs(fourier_weighted_diff).pow(2).mean()
+        fourier_weighted_diff = fourier_output - fourier_target
+        spectral_loss = (torch.abs(fourier_weighted_diff).pow(2) * fourier_mask).mean()
         return spectral_loss  # scale down
 
     def _spectral_anchoring_loss_att(attack_img, defense_img, net_output):
         target = attack_img
         fourier_target = torch.fft.fft2(target).squeeze()
         fourier_output = torch.fft.fft2(net_output).squeeze()
-        fourier_weighted_diff = (fourier_output - fourier_target) * fourier_mask
-        spectral_loss = torch.abs(fourier_weighted_diff).pow(2).mean()
+        fourier_weighted_diff = fourier_output - fourier_target
+        spectral_loss = (torch.abs(fourier_weighted_diff).pow(2) * fourier_mask).mean()
         return spectral_loss  # scale down
 
     if anchor_to == "defense":

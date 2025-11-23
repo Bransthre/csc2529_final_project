@@ -63,6 +63,16 @@ flags.DEFINE_float(
 flags.DEFINE_integer(
     "num_iter_per_image", default=2400, help="Number of DIP iterations"
 )
+flags.DEFINE_integer(
+    "retrain_dip_every_attack",
+    default=1,
+    help="Whether to retrain DIP from scratch for every attack",
+)
+flags.DEFINE_integer(
+    "anchor_with_past_examples",
+    default=1,
+    help="Whether to update past examples for anchoring",
+)
 
 torch.backends.cudnn.enabled = True
 torch.backends.cudnn.benchmark = True
@@ -165,7 +175,9 @@ def train_dip_on_image(
             past_attack_weights = torch.clip(past_attack_weights, min=0.9)
             past_attack_weights = past_attack_weights.type(dtype).to(net_input.device)
 
-            past_attacks_losses = (past_attacks_losses * past_attack_weights).sum()
+            past_attacks_losses = (
+                anchoring_loss_weight * past_attacks_losses * past_attack_weights
+            ).sum()
             past_attack_weight_sum = past_attack_weights.sum()
         else:
             past_attacks_losses = torch.tensor(0.0).type(dtype)
@@ -321,8 +333,28 @@ def main(argv):
         )
         net_input = np_to_torch(current_net_input).type(dtype).to(dev)
 
+        if FLAGS.retrain_dip_every_attack:
+            input_dip_net, net_info = get_net_from_domain(FLAGS.target_img_domain)
+            input_depth = net_info["input_depth"]
+            num_iter = FLAGS.num_iter_per_image  # net_info["num_iter"]
+            input_dip_net = input_dip_net.type(dtype)
+            optimizer = torch.optim.Adam(
+                get_params("net", input_dip_net, None), lr=0.01
+            )
+        else:
+            input_dip_net = dip_net
+
+        if FLAGS.anchor_with_past_examples:
+            input_past_attacks = prev_x_attacks
+            input_past_inputs = prev_x_inputs
+            input_past_defenses = prev_ses_imgs
+        else:
+            input_past_attacks = []
+            input_past_inputs = []
+            input_past_defenses = []
+
         dip_defend_output = train_dip_on_image(
-            per_image_dip_net=dip_net,  # This net will be updated constantly
+            per_image_dip_net=input_dip_net,  # This net will be updated constantly
             attacked_img=adv_image_input,
             net_input=net_input,
             num_iter=num_iter,
@@ -332,9 +364,9 @@ def main(argv):
             optimizer=optimizer,
             anchoring_loss_fn=anchoring_loss_fn,
             anchoring_loss_weight=FLAGS.anchoring_loss_weight,
-            past_attacks=prev_x_attacks,
-            past_net_inputs=prev_x_inputs,
-            past_defenses=prev_ses_imgs,
+            past_attacks=input_past_attacks,
+            past_net_inputs=input_past_inputs,
+            past_defenses=input_past_defenses,
         )
 
         psnr_max_img, ses_img, defense_info = dip_defend_output
@@ -351,7 +383,7 @@ def main(argv):
         with torch.no_grad():
             for idx, past_example in enumerate(prev_x_attacks):
                 past_attacks_defended = dip_output_of_image(
-                    dip_net,
+                    input_dip_net,
                     np_to_torch(prev_x_inputs[idx]).type(dtype).to(dev),
                     reg_noise_std=1.0 / 30.0,
                 )
@@ -388,6 +420,7 @@ def main(argv):
             )
 
         num_attacks_so_far += 1
+
         prev_x_attacks.append(adv_image_input)
         prev_x_inputs.append(current_net_input)
         prev_ses_imgs.append(ses_img)
@@ -396,13 +429,15 @@ def main(argv):
             net_input_saved = net_input.detach().clone()
             noise = net_input.detach().clone()
             net_input = net_input_saved + (noise.normal_() * 1 / 30.0)
-            out = dip_net(net_input)
+            out = input_dip_net(net_input)
 
             final_total_loss = (
                 (out.mean(dim=0, keepdim=True) - img_noisy_torch).pow(2).mean()
             )
 
-            dip_objective.expand_examples(list(dip_net.parameters()), final_total_loss)
+            dip_objective.expand_examples(
+                list(input_dip_net.parameters()), final_total_loss
+            )
 
         if num_attacks_so_far >= FLAGS.attack_length:
             break
