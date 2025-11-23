@@ -60,6 +60,9 @@ flags.DEFINE_float("fourier_mask_alpha", default=10.0, help="Alpha for fourier m
 flags.DEFINE_float(
     "anchoring_loss_weight", default=1.0, help="Weight for anchoring loss"
 )
+flags.DEFINE_integer(
+    "num_iter_per_image", default=2400, help="Number of DIP iterations"
+)
 
 torch.backends.cudnn.enabled = True
 torch.backends.cudnn.benchmark = True
@@ -107,10 +110,12 @@ def train_dip_on_image(
     noise = net_input.detach().clone()
 
     check_past_example_losses = len(past_net_inputs) > 0
-    print(past_net_inputs)
-    past_net_inputs = np_to_torch(np.array(past_net_inputs)).type(dtype)
-    past_attacks = np_to_torch(np.array(past_attacks)).type(dtype)
-    past_defenses = np_to_torch(np.array(past_defenses)).type(dtype)
+    past_net_inputs = [
+        np_to_torch(past_input).type(dtype).to(net_input.device)
+        for past_input in past_net_inputs
+    ]
+    past_attacks = np_to_torch(np.array(past_attacks)).type(dtype).squeeze()
+    past_defenses = np_to_torch(np.array(past_defenses)).type(dtype).squeeze()
 
     past_example_losses = []
     current_example_losses = []
@@ -126,22 +131,49 @@ def train_dip_on_image(
             out.mean(dim=0, keepdim=True),
             list(per_image_dip_net.parameters()),
         )
-        past_attacks_losses = torch.tensor(0.0).type(dtype)
+
         past_attacks_current_defense = None
 
         if check_past_example_losses:
-            past_attacks_current_defense = dip_output_of_image(
-                per_image_dip_net,
-                past_net_inputs,
-                reg_noise_std,
+            past_attacks_current_defense = torch.stack(
+                [
+                    dip_output_of_image(
+                        per_image_dip_net,
+                        past_input,
+                        reg_noise_std,
+                    )
+                    for past_input in past_net_inputs
+                ]
             )
-            past_attacks_losses = anchoring_loss_fn(
-                past_attacks,
-                past_defenses,
-                past_attacks_current_defense.squeeze(),
-            ).mean()
+            past_attacks_losses = torch.stack(
+                [
+                    anchoring_loss_fn(
+                        past_attack.unsqueeze(0),
+                        past_defense.unsqueeze(0),
+                        past_attack_current_defense.unsqueeze(0),
+                    )
+                    for past_attack, past_defense, past_attack_current_defense in zip(
+                        past_attacks,
+                        past_defenses,
+                        past_attacks_current_defense,
+                    )
+                ]
+            )
 
-        total_loss = current_attack_loss + past_attacks_losses * anchoring_loss_weight
+            reversed_idxs = torch.flip(torch.arange(len(past_net_inputs)), dims=(0,))
+            past_attack_weights = 0.99 ** (1 + reversed_idxs)
+            past_attack_weights = torch.clip(past_attack_weights, min=0.9)
+            past_attack_weights = past_attack_weights.type(dtype).to(net_input.device)
+
+            past_attacks_losses = (past_attacks_losses * past_attack_weights).sum()
+            past_attack_weight_sum = past_attack_weights.sum()
+        else:
+            past_attacks_losses = torch.tensor(0.0).type(dtype)
+            past_attack_weight_sum = 1.0
+
+        total_loss = (current_attack_loss + past_attacks_losses) / (
+            1 + past_attack_weight_sum
+        )
         past_example_losses.append(past_attacks_losses.item())
         current_example_losses.append(current_attack_loss.item())
 
@@ -173,19 +205,24 @@ def train_dip_on_image(
             if series[-1] > np.array(series[:-1]).max():
                 psnr_max_img = out.detach().cpu().numpy().mean(axis=0)
 
+        if psnr_max_img is None:
+            psnr_max_img = out.detach().cpu().numpy().mean(axis=0)
+
         return (
             total_loss,
             (net_input, psnr_max_img, SES_img),
             past_attacks_current_defense,
         )
 
-    dip_losses = []
+    total_losses = []
     for n_train_iter in tqdm(range(num_iter), desc="DIP Denoising iterations"):
         optimizer.zero_grad()
-        dip_loss, (net_input, psnr_max_img, SES_img), past_attacks_current_defenses = (
-            closure(net_input, psnr_max_img, SES_img)
-        )
-        dip_losses.append(dip_loss)
+        (
+            total_loss,
+            (net_input, psnr_max_img, SES_img),
+            past_attacks_current_defenses,
+        ) = closure(net_input, psnr_max_img, SES_img)
+        total_losses.append(total_loss)
         optimizer.step()
 
     if SES_img is None:
@@ -198,10 +235,10 @@ def train_dip_on_image(
             "series": series[::100],
             "out_series": out_series[::100],
             "delta_series": delta_series[::100],
-            "dip_losses": dip_losses[::100],
-            "past_example_losses": [arr[::100] for arr in past_example_losses],
+            "total_losses": total_losses[::100],
+            "past_example_losses": past_example_losses[::100],
             "current_example_losses": current_example_losses[::100],
-            "past_defenses": past_attacks_current_defenses.detach().cpu().numpy(),
+            "past_defenses": past_attacks_current_defenses,
         },
     )
 
@@ -231,17 +268,18 @@ def main(argv):
 
     dip_net, net_info = get_net_from_domain(FLAGS.target_img_domain)
     input_depth = net_info["input_depth"]
-    num_iter = net_info["num_iter"]
+    num_iter = FLAGS.num_iter_per_image  # net_info["num_iter"]
     dip_net = dip_net.type(dtype)
 
     validation_set = get_imagenet_dataset("val")
+    torch.manual_seed(0)
     example_dataloader = DataLoader(
         validation_set, batch_size=1, shuffle=True, drop_last=True
     )
     tk = torchattacks.PGD(resnet_classifier, eps=0.03, alpha=0.005, steps=40)
 
     if FLAGS.anchoring_loss_fn == "mse":
-        anchoring_loss_fn = lambda attack, defense, output: mse_loss(output, attack)
+        anchoring_loss_fn = lambda attack, defense, output: mse_loss(output, defense)
     elif FLAGS.anchoring_loss_fn == "spectral":
         anchoring_loss_fn = spectral_anchoring_loss(
             FLAGS.fourier_mask_alpha, (224, 224), dev, anchor_to=FLAGS.anchor_to
@@ -275,8 +313,11 @@ def main(argv):
         inform_about_attack(original_logits, adversarial_logits, y_example)
 
         adv_image_input = adv_image.detach().cpu().numpy()[0]
-        current_net_input = adv_image_input + 0.15 * np.random.randn(
-            *adv_image_input.shape
+        # current_net_input = adv_image_input + 0.15 * np.random.randn(
+        #     *adv_image_input.shape
+        # )
+        current_net_input = np.clip(
+            0.5 + 0.5 * np.random.randn(*adv_image_input.shape), 0.0, 1.0
         )
         net_input = np_to_torch(current_net_input).type(dtype).to(dev)
 
@@ -312,8 +353,6 @@ def main(argv):
                 past_attacks_defended = dip_output_of_image(
                     dip_net,
                     np_to_torch(prev_x_inputs[idx]).type(dtype).to(dev),
-                    past_example,
-                    input_depth,
                     reg_noise_std=1.0 / 30.0,
                 )
                 past_example_defended_logits = resnet_classifier(past_attacks_defended)
@@ -359,11 +398,11 @@ def main(argv):
             net_input = net_input_saved + (noise.normal_() * 1 / 30.0)
             out = dip_net(net_input)
 
-            final_dip_loss = (
+            final_total_loss = (
                 (out.mean(dim=0, keepdim=True) - img_noisy_torch).pow(2).mean()
             )
 
-            dip_objective.expand_examples(list(dip_net.parameters()), final_dip_loss)
+            dip_objective.expand_examples(list(dip_net.parameters()), final_total_loss)
 
         if num_attacks_so_far >= FLAGS.attack_length:
             break
