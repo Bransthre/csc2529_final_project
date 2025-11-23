@@ -134,3 +134,5 @@ defense_*.py
 attack_examples/*
 blas_the_dog/*
 script_logpoint*
+*.out
+*.err

@@ -1,41 +1,59 @@
 #!/bin/bash
 
-source /home/bransthr/.envs/csc2529/bin/activate
+# sbatch --account=aip-florian7 \
+#     --gres=gpu:l40s:1 \
+#     --mem=10G \
+#     --time=2:00:00 \
+#     --cpus-per-task=8 \
+#     --ntasks=1 \
+#     ./script_launchpoint/launch_attack.sh imagenet script_logpoint/no_increments 50 0 fake attack 1.0
 
-# Launch without increment
-python test_build_consecutive_naive_dip.py \
-    --target_img_domain imagenet \
-    --save_dir script_logpoint/no_increments \
-    --attack_length 50 \
-    --anchoring_loss_fn fake
+# sbatch --account=aip-florian7 \
+#     --gres=gpu:l40s:1 \
+#     --mem=10G \
+#     --time=2:00:00 \
+#     --cpus-per-task=8 \
+#     --ntasks=1 \
+#     ./script_launchpoint/launch_attack.sh imagenet script_logpoint/ewc 50 1 fake attack 1.0
 
-# Launch with EWC (shouldn't work)
-python test_build_consecutive_naive_dip.py \
-    --target_img_domain imagenet \
-    --save_dir script_logpoint/no_increments \
-    --attack_length 50 \
-    --anchoring_loss_fn fake \
-    --update_ewc True
+sbatch --account=aip-florian7 \
+    --gres=gpu:l40s:1 \
+    --mem=10G \
+    --time=2:00:00 \
+    --cpus-per-task=8 \
+    --ntasks=1 \
+    ./script_launchpoint/launch_attack.sh imagenet script_logpoint/no_ewc_mse_anchor 50 0 mse attack 1.0
 
-# Launch without EWC, with MSE anchoring to attack
-python test_build_consecutive_naive_dip.py \
-    --target_img_domain imagenet \
-    --save_dir script_logpoint/no_increments \
-    --attack_length 50 \
-    --anchoring_loss_fn mse
+# sbatch --account=aip-florian7 \
+#     --gres=gpu:l40s:1 \
+#     --mem=10G \
+#     --time=2:00:00 \
+#     --cpus-per-task=8 \
+#     --ntasks=1 \
+#     ./script_launchpoint/launch_attack.sh imagenet script_logpoint/no_ewc_spectral_anchor_attack 50 0 spectral attack 1.0
 
-# Launch without EWC, with spectral anchoring to defense
-python test_build_consecutive_naive_dip.py \
-    --target_img_domain imagenet \
-    --save_dir script_logpoint/no_increments \
-    --attack_length 50 \
-    --anchoring_loss_fn spectral \
-    --anchor_to defense
+# sbatch --account=aip-florian7 \
+#     --gres=gpu:l40s:1 \
+#     --mem=10G \
+#     --time=2:00:00 \
+#     --cpus-per-task=8 \
+#     --ntasks=1 \
+#     ./script_launchpoint/launch_attack.sh imagenet script_logpoint/no_ewc_spectral_anchor_defense 50 0 spectral defense 1.0
 
-# Launch without EWC, with spectral anchoring to attack
-python test_build_consecutive_naive_dip.py \
-    --target_img_domain imagenet \
-    --save_dir script_logpoint/no_increments \
-    --attack_length 50 \
-    --anchoring_loss_fn spectral \
-    --anchor_to attack
+# sbatch --account=aip-florian7 \
+#     --gres=gpu:l40s:1 \
+#     --mem=10G \
+#     --time=2:00:00 \
+#     --cpus-per-task=8 \
+#     --ntasks=1 \
+#     ./script_launchpoint/launch_attack.sh imagenet script_logpoint/no_ewc_spectral_anchor_attack_smaller_weight 50 0 spectral attack 0.01
+
+# sbatch --account=aip-florian7 \
+#     --gres=gpu:l40s:1 \
+#     --mem=10G \
+#     --time=2:00:00 \
+#     --cpus-per-task=8 \
+#     --ntasks=1 \
+#     ./script_launchpoint/launch_attack.sh imagenet script_logpoint/no_ewc_spectral_anchor_defense_smaller_weight 50 0 spectral defense 0.01
+
+
