@@ -13,8 +13,9 @@ export ANCHORING_LOSS_WEIGHT=$5
 export RETRAIN_DIP_EVERY_ATTACK=$6
 export ANCHOR_WITH_PAST_EXAMPLES=$7
 export NUM_ITER_PER_IMAGE=$8
+export SEQUENCE_SEED=$9
 
-python test_build_consecutive_naive_dip.py \
+python run_experiments.py \
     --target_img_domain imagenet \
     --attack_length 50 \
     --save_dir $SAVE_DIR \
@@ -24,4 +25,5 @@ python test_build_consecutive_naive_dip.py \
     --anchoring_loss_weight $ANCHORING_LOSS_WEIGHT \
     --retrain_dip_every_attack $RETRAIN_DIP_EVERY_ATTACK \
     --anchor_with_past_examples $ANCHOR_WITH_PAST_EXAMPLES \
-    --num_iter_per_image $NUM_ITER_PER_IMAGE
+    --num_iter_per_image $NUM_ITER_PER_IMAGE \
+    --sequence_seed $SEQUENCE_SEED

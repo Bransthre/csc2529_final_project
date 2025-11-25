@@ -17,5 +17,5 @@ echo 'Running jobs : ' \$((running_job_count - 1))
 echo 'Total jobs   : ' \$total_job_count
 
 echo -e '\n--- Current squeue ---'
-squeue -u ${USER_NAME} -o '%.9i %.12P %.30j %.8u %.2t %.10M %.6D %R' --sort=-t
+squeue -u ${USER_NAME} -o '%.9i %.12P %.30j %.8u %.2t %.10M %.6D %R' --sort=-i
 "
