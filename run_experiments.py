@@ -1,6 +1,5 @@
 import copy
 import os
-import pickle
 import warnings
 
 import numpy as np
@@ -17,7 +16,6 @@ from idip_defend.utils.common_utils import (
     adapative_psnr,
     fake_loss,
     get_net_from_domain,
-    get_noise,
     get_params,
     inform_about_attack,
     np_to_torch,
@@ -88,6 +86,16 @@ def dip_output_of_image(
     net_input: torch.Tensor,
     reg_noise_std=1.0 / 30.0,
 ):
+    """
+    Get the output of a DIP network for a single image, adding noise to the input
+
+    Args:
+        per_image_dip_net: The DIP network
+        net_input: The input to the DIP network
+        reg_noise_std: The standard deviation of the noise to add to the input
+    Returns:
+        The output of the DIP network after adding noise to the input
+    """
     net_input_saved = net_input.detach().clone()
     noise = net_input.detach().clone()
     if reg_noise_std > 0:
@@ -114,6 +122,28 @@ def train_dip_on_image(
     past_attacks=[],
     past_defenses=[],
 ):
+    """
+    Train a DIP network on a single attacked image, with optional anchoring to past examples
+    Args:
+        per_image_dip_net: The DIP network to train
+        net_input: The input to the DIP network
+        attacked_img: The attacked image to defend
+        num_iter: The number of training iterations
+        input_depth: The depth of the input to the DIP network
+        ses_parameter: The SES parameter for smoothing
+        dip_objective: The objective function for training the DIP network
+        anchoring_loss_fn: The anchoring loss function
+        optimizer: The optimizer for training the DIP network
+        anchoring_loss_weight: The weight for the anchoring loss
+        reg_noise_std: The standard deviation of the noise to add to the input
+        past_net_inputs: A list of past inputs to anchor to
+        past_attacks: A list of past attacked images to anchor to
+        past_defenses: A list of past defended images to anchor to
+    Returns:
+        psnr_max_img: The image with the maximum PSNR during training
+        SES_img: The SES smoothed image
+        A dictionary with training statistics
+    """
     series, out_series, delta_series = [], [], []
     psnr_max_img, SES_img = None, None
 
@@ -135,6 +165,18 @@ def train_dip_on_image(
 
     # Can probably clean the series thing up a bit more
     def closure(net_input, psnr_max_img, SES_img):
+        """
+        Closure for DIP training with anchoring to past examples
+
+        Args:
+            net_input: The input to the DIP network
+            psnr_max_img: The image with the maximum PSNR so far
+            SES_img: The SES smoothed image so far
+        Returns:
+            total_loss: The total loss for the current iteration
+            A tuple with the updated net_input, psnr_max_img, and SES_img
+            past_attacks_current_defense: The current defense outputs for past attacks
+        """
         if reg_noise_std > 0:
             net_input = net_input_saved + (noise.normal_() * reg_noise_std)
 

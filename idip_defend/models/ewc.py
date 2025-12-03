@@ -5,6 +5,8 @@ import torch.nn as nn
 
 
 class EWC(nn.Module):
+    "Elastic Weight Consolidation (EWC) regularization module."
+
     def __init__(
         self,
         main_task_objective: nn.Module,
@@ -20,15 +22,20 @@ class EWC(nn.Module):
         return [item.detach().clone() for item in lst]
 
     def expand_examples(self, prev_task_params, prev_task_loss):
-        # do something, should take the parameter and consider the fisher
+        """
+        Store the parameters and fisher diagonals for a previous task
+
+        Args:
+            prev_task_params: List of torch.Tensor
+                The parameters of the network after training on the previous task
+            prev_task_loss: torch.Tensor
+                The loss on the previous task, used to compute gradients for fisher
+        """
         task_grads = [
             torch.autograd.grad(prev_task_loss, new_param, retain_graph=True)[0]
             for new_param in prev_task_params
         ]
-        # task_fisher_diags = [grad.pow(2) for grad in task_grads]
-        # task_fisher_diags_means = torch.stack([f.mean() for f in task_fisher_diags])
-        # task_fisher_diags_scale = 1.0 / (task_fisher_diags_means.mean() + 1e-12)
-        # task_fisher_diags = [f * task_fisher_diags_scale for f in task_fisher_diags]
+
         task_fisher_diags = [
             torch.tensor(1.0).to(prev_task_params[0].device) for _ in task_grads
         ]

@@ -11,6 +11,19 @@ torch.nn.Module.add = add_module
 
 
 def get_kernel(factor, kernel_type, phase, kernel_width, support=None, sigma=None):
+    """
+    Generate a resampling kernel based on the specified parameters.
+
+    Args:
+        factor (int): Downsampling factor.
+        kernel_type (str): Type of kernel ('lanczos', 'gauss', 'box').
+        phase (float): Phase shift (0 or 0.5).
+        kernel_width (int): Width of the kernel.
+        support (int, optional): Support for Lanczos kernel.
+        sigma (float, optional): Standard deviation for Gaussian kernel.
+    Returns:
+        np.ndarray: The generated kernel.
+    """
     assert kernel_type in ["lanczos", "gauss", "box"]
 
     # factor  = float(factor)
@@ -80,6 +93,11 @@ def get_kernel(factor, kernel_type, phase, kernel_width, support=None, sigma=Non
     kernel /= kernel.sum()
 
     return kernel
+
+
+############################################
+######### MODULES FOR RES-UNETS ############
+############################################
 
 
 class Downsampler(nn.Module):

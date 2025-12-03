@@ -165,6 +165,23 @@ def get_skip_net_special(
     num_scales=5,
     downsample_mode="stride",
 ):
+    """
+    Assembles a skip connection network with specified hyperparameters.
+
+    Args:
+        input_depth (int): Number of input channels.
+        pad (str): Padding type ('zero' or 'reflection').
+        upsample_mode (str): Upsampling method ('nearest' or 'bilinear').
+        n_channels (int): Number of output channels. Default is 3.
+        act_fun (str): Activation function ('LeakyReLU', 'Swish', 'ELU', 'none'). Default is 'LeakyReLU'.
+        skip_n33d (int or list): Number of channels in downsampling layers. Default is 128.
+        skip_n33u (int or list): Number of channels in upsampling layers. Default is 128.
+        skip_n11 (int or list): Number of channels in skip connections. Default is 4.
+        num_scales (int): Number of scales in the network. Default is 5.
+        downsample_mode (str): Downsampling method ('stride', 'avg', 'max', 'lanczos2'). Default is 'stride'.
+    Returns:
+        nn.Module: The constructed skip connection network.
+    """
     return skip(
         input_depth,
         n_channels,

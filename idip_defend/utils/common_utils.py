@@ -1,31 +1,8 @@
-import sys
-
-import matplotlib.pyplot as plt
 import numpy as np
-import PIL
 import torch
-import torchvision
-from PIL import Image
 from skimage.metrics import peak_signal_noise_ratio as compare_psnr
-from torch.autograd import Variable
 
 from idip_defend.models.skip import skip
-
-
-def crop_image(img, d=32):
-    """Make dimensions divisible by `d`"""
-
-    new_size = (img.size[0] - img.size[0] % d, img.size[1] - img.size[1] % d)
-
-    bbox = [
-        int((img.size[0] - new_size[0]) / 2),
-        int((img.size[1] - new_size[1]) / 2),
-        int((img.size[0] + new_size[0]) / 2),
-        int((img.size[1] + new_size[1]) / 2),
-    ]
-
-    img_cropped = img.crop(bbox)
-    return img_cropped
 
 
 def get_params(opt_over, net, net_input, downsampler=None):
@@ -55,146 +32,6 @@ def get_params(opt_over, net, net_input, downsampler=None):
     return params
 
 
-def get_image_grid(images_np, nrow=8):
-    """Creates a grid from a list of images by concatenating them."""
-    images_torch = [torch.from_numpy(x) for x in images_np]
-    torch_grid = torchvision.utils.make_grid(images_torch, nrow)
-
-    return torch_grid.numpy()
-
-
-def plot_image_grid(images_np, nrow=8, factor=1, interpolation="lanczos"):
-    """Draws images in a grid
-
-    Args:
-        images_np: list of images, each image is np.array of size 3xHxW of 1xHxW
-        nrow: how many images will be in one row
-        factor: size if the plt.figure
-        interpolation: interpolation used in plt.imshow
-    """
-    n_channels = max(x.shape[0] for x in images_np)
-    assert (n_channels == 3) or (n_channels == 1), "images should have 1 or 3 channels"
-
-    images_np = [
-        x if (x.shape[0] == n_channels) else np.concatenate([x, x, x], axis=0)
-        for x in images_np
-    ]
-
-    grid = get_image_grid(images_np, nrow)
-
-    plt.figure(figsize=(len(images_np) + factor, 12 + factor))
-
-    if images_np[0].shape[0] == 1:
-        plt.imshow(grid[0], cmap="gray", interpolation=interpolation)
-    else:
-        plt.imshow(grid.transpose(1, 2, 0), interpolation=interpolation)
-
-    plt.show()
-
-    return grid
-
-
-def load(path):
-    """Load PIL image."""
-    img = Image.open(path)
-    return img
-
-
-def get_image(path, imsize=-1):
-    """Load an image and resize to a cpecific size.
-
-    Args:
-        path: path to image
-        imsize: tuple or scalar with dimensions; -1 for `no resize`
-    """
-    img = load(path)
-
-    if isinstance(imsize, int):
-        imsize = (imsize, imsize)
-
-    if imsize[0] != -1 and img.size != imsize:
-        if imsize[0] > img.size[0]:
-            img = img.resize(imsize, Image.BICUBIC)
-        else:
-            img = img.resize(imsize, Image.ANTIALIAS)
-
-    img_np = pil_to_np(img)
-
-    return img, img_np
-
-
-def fill_noise(x, noise_type):
-    """Fills tensor `x` with noise of type `noise_type`."""
-    if noise_type == "u":
-        x.uniform_()
-    elif noise_type == "n":
-        x.normal_()
-    else:
-        assert False
-
-
-def get_noise(input_depth, method, spatial_size, noise_type="u", var=1.0 / 10):
-    """Returns a pytorch.Tensor of size (1 x `input_depth` x `spatial_size[0]` x `spatial_size[1]`)
-    initialized in a specific way.
-    Args:
-        input_depth: number of channels in the tensor
-        method: `noise` for fillting tensor with noise; `meshgrid` for np.meshgrid
-        spatial_size: spatial size of the tensor to initialize
-        noise_type: 'u' for uniform; 'n' for normal
-        var: a factor, a noise will be multiplicated by. Basically it is standard deviation scaler.
-    """
-    if isinstance(spatial_size, int):
-        spatial_size = (spatial_size, spatial_size)
-    if method == "noise":
-        shape = [1, input_depth, spatial_size[0], spatial_size[1]]
-        net_input = torch.zeros(shape)
-
-        fill_noise(net_input, noise_type)
-        net_input *= var
-    elif method == "meshgrid":
-        assert input_depth == 2
-        X, Y = np.meshgrid(
-            np.arange(0, spatial_size[1]) / float(spatial_size[1] - 1),
-            np.arange(0, spatial_size[0]) / float(spatial_size[0] - 1),
-        )
-        meshgrid = np.concatenate([X[None, :], Y[None, :]])
-        net_input = np_to_torch(meshgrid)
-    else:
-        assert False
-
-    return net_input
-
-
-def pil_to_np(img_PIL):
-    """Converts image in PIL format to np.array.
-
-    From W x H x C [0...255] to C x W x H [0..1]
-    """
-    ar = np.array(img_PIL)
-
-    if len(ar.shape) == 3:
-        ar = ar.transpose(2, 0, 1)
-    else:
-        ar = ar[None, ...]
-
-    return ar.astype(np.float32) / 255.0
-
-
-def np_to_pil(img_np):
-    """Converts image in np.array format to PIL image.
-
-    From C x W x H [0..1] to  W x H x C [0...255]
-    """
-    ar = np.clip(img_np * 255, 0, 255).astype(np.uint8)
-
-    if img_np.shape[0] == 1:
-        ar = ar[0]
-    else:
-        ar = ar.transpose(1, 2, 0)
-
-    return Image.fromarray(ar)
-
-
 def np_to_torch(img_np):
     """Converts image in numpy.array to torch.Tensor.
 
@@ -203,55 +40,17 @@ def np_to_torch(img_np):
     return torch.from_numpy(img_np)[None, :]
 
 
-def torch_to_np(img_var):
-    """Converts an image in torch.Tensor format to np.array.
-
-    From 1 x C x W x H [0..1] to  C x W x H [0..1]
-    """
-    return img_var.detach().cpu().numpy()[0]
-
-
-def optimize(optimizer_type, parameters, closure, LR, num_iter):
-    optimizer = torch.optim.Adam(parameters, lr=LR)
-    for j in range(num_iter):
-        optimizer.zero_grad()
-        closure()
-        optimizer.step()
-
-
-def get_noisy_image(img_np, sigma):
-    """Adds Gaussian noise to an image.
-
-    Args:
-        img_np: image, np.array with values from 0 to 1
-        sigma: std of the noise
-    """
-    img_noisy_np = np.clip(
-        img_np + np.random.normal(scale=sigma, size=img_np.shape), 0, 1
-    ).astype(np.float32)
-    img_noisy_pil = np_to_pil(img_noisy_np)
-
-    return img_noisy_pil, img_noisy_np
-
-
-def preprocess_image(cv2im, resize_im=True):
-    """
-        Processes image for CNNs
-
-    Args:
-        PIL_img (PIL_img): Image to process
-        resize_im (bool): Resize to 224 or not
-    returns:
-        im_as_var (Pytorch variable): Variable that contains processed float tensor
-    """
-
-    im_as_ten = torch.from_numpy(cv2im).float()
-    im_as_ten.unsqueeze_(0)
-    im_as_var = Variable(im_as_ten, requires_grad=False).to(0)
-    return im_as_var
-
-
 def adapative_psnr(img1, img2, size=32):
+    """
+    Calculates the minimum PSNR over all size x size patches.
+
+    Args:
+        img1: torch.Tensor of shape C x H x W
+        img2: torch.Tensor of shape C x H x W
+        size: int, size of the patches
+    Returns:
+        psnr: float, minimum PSNR over all patches
+    """
     psnr, area_cnt = [], 0
     _, h, w = img1.shape
 
@@ -266,6 +65,14 @@ def adapative_psnr(img1, img2, size=32):
 
 
 def inform_about_attack(original_logits, adversarial_logits, y_example):
+    """
+    Prints the original and adversarial predictions of the model.
+
+    Args:
+        original_logits: torch.Tensor, logits of the original image
+        adversarial_logits: torch.Tensor, logits of the adversarial image
+        y_example: torch.Tensor, correct label of the image
+    """
     print("Current image correct y prediction:", y_example.item())
     print(
         "Current image original prediction:",
@@ -278,6 +85,15 @@ def inform_about_attack(original_logits, adversarial_logits, y_example):
 
 
 def get_net_from_domain(image_domain):
+    """
+    Returns DIP network and its hyperparameters based on the image domain.
+
+    Args:
+        image_domain: str, either "cifar" or "imagenet"
+    Returns:
+        dip_net: torch.nn.Module, DIP network
+        hyperparams: dict, hyperparameters of the DIP network
+    """
     if image_domain == "cifar":
         input_depth = 1
         num_iter = 1200
@@ -310,6 +126,17 @@ def get_net_from_domain(image_domain):
 
 
 def spectral_anchoring_loss(mask_alpha, img_hw, device, anchor_to="defense"):
+    """
+    Returns a spectral anchoring loss function.
+
+    Args:
+        mask_alpha: float, parameter for the Gaussian mask in the frequency domain
+        img_hw: tuple, (height, width) of the images
+        device: torch.device, device to run the computations on
+        anchor_to: str, either "defense" or "attack", indicating which image to anchor to
+    Returns:
+        spectral_anchoring_loss_fn: function, spectral anchoring loss function
+    """
     H, W = img_hw
     fy = torch.fft.fftfreq(H, device=device).reshape(-1, 1)
     fx = torch.fft.fftfreq(W, device=device).reshape(1, -1)
@@ -339,6 +166,14 @@ def spectral_anchoring_loss(mask_alpha, img_hw, device, anchor_to="defense"):
 
 
 def fake_loss(device):
+    """
+    Returns a fake loss function that always returns zero.
+
+    Args:
+        device: torch.device, device to run the computations on
+    Returns:
+        fake_loss_fn: function, fake loss function
+    """
 
     def _fake_loss(*args, **kwargs):
         return torch.tensor(0.0, device=device)

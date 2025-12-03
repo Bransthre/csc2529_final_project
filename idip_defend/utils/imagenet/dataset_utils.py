@@ -1,4 +1,5 @@
-import copy
+# Some work here is heavily based on https://github.com/marcusGH/adversarial-attacks-on-imagenet-models/tree/main
+
 import glob
 import io
 import json
@@ -10,9 +11,8 @@ import requests
 import torch
 from PIL import Image
 from torch import nn
-from torch.nn.functional import softmax
-from torch.utils.data import DataLoader, Dataset
-from torchvision import models, transforms
+from torch.utils.data import Dataset
+from torchvision import transforms
 
 from idip_defend.utils.imagenet.eval_utils import *
 
@@ -134,5 +134,17 @@ class CustomDataset(Dataset):
 
 
 def get_imagenet_dataset(split, frac=None):
+    """
+    Utility function to get the custom ImageNet dataset
+
+    Parameters
+    --------------
+    split : str
+      One of "train", "val" or "test"
+    frac : float
+      A value between 0.0 and 1.0. If specified, only this fraction of the found
+      data will be used to create the dataset, and the dataset is shuffled before
+      doing so.
+    """
     assert split in ["train", "val", "test"]
     return CustomDataset(Path("./dataset/mini-imagenet/"), split, frac)

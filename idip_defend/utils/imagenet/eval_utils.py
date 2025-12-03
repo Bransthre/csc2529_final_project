@@ -1,3 +1,5 @@
+# Some work here is heavily based on https://github.com/marcusGH/adversarial-attacks-on-imagenet-models/tree/main
+
 import json
 
 import matplotlib.pyplot as plt
