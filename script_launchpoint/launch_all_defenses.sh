@@ -5,7 +5,7 @@ anchoring_weight_mse=(0.5 1 2)
 anchoring_weight_spectral=(0.0005 0.001 0.002)
 num_iter=(1200 1800 2400)
 
-seeds=(1 2 3 4)
+seeds=(0 1 2 3 4)
 
 for seed in "${seeds[@]}"; do
     # REGION A: Baselines
